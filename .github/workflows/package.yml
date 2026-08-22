@@ -1,0 +1,110 @@
+#
+# Copyright (c) Contributors to the Open 3D Engine Project.
+# For complete copyright and license terms please see the LICENSE at the root of this distribution.
+#
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+#
+
+name: Package
+
+# Entry point for producing the signed O3DE engine installer SDK. Fans out to the
+# per-OS reusable workflows (windows-package.yml / linux-package.yml).
+
+run-name: Package - ${{ inputs.platforms }} (${{ inputs.engine_ref }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Which OS installer(s) to produce.
+        type: choice
+        options:
+          - windows
+          - linux
+          - both
+        default: windows
+      engine_repo:
+        description: O3DE engine repository (owner/name) to package.
+        type: string
+        default: o3de/o3de
+      engine_ref:
+        description: Branch/tag/SHA of the engine to package.
+        type: string
+        default: development
+      windows_image:
+        description: GitHub-hosted runner image for the Windows installer.
+        type: string
+        default: windows-2022
+      linux_image:
+        description: GitHub-hosted runner image for the Linux installer (e.g. ubuntu-22.04, ubuntu-24.04).
+        type: string
+        default: ubuntu-22.04
+      o3de_install_version:
+        description: The O3DE version in the installer filename and engine version.
+        type: string
+        default: ""
+      o3de_install_display_version:
+        description: The O3DE display version in the installer filename and engine display version.
+        type: string
+        default: ""
+      o3de_install_build_version:
+        description: The O3DE version shown in the splash screens.
+        type: string
+        default: ""
+      installer_download_url:
+        description: Base URL embedded into the installer for downloading additional artifacts.
+        type: string
+        default: ""
+      windows_installer_s3_path:
+        description: S3 object key (leading slash) for the Windows installer that installer_test pulls.
+        type: string
+        default: /development/Latest/Windows/o3de_installer.exe
+      linux_installer_s3_path:
+        description: S3 object key (leading slash) for the Linux installer.
+        type: string
+        default: /development/Latest/Linux/o3de_installer.deb
+      run_installer_test:
+        description: Run the installer smoke test after the build (Windows only for now).
+        type: boolean
+        default: true
+      environment:
+        description: GitHub Environment supplying signing/upload secrets. Empty runs unsigned with no upload.
+        type: string
+        default: packaging
+
+jobs:
+  Windows:
+    if: ${{ inputs.platforms == 'windows' || inputs.platforms == 'both' }}
+    uses: ./.github/workflows/windows-package.yml
+    with:
+      image: ${{ inputs.windows_image }}
+      engine_repo: ${{ inputs.engine_repo }}
+      engine_ref: ${{ inputs.engine_ref }}
+      msvc_toolset_version: "14.44"
+      msvc_platform_toolset: "v143"
+      o3de_install_version: ${{ inputs.o3de_install_version }}
+      o3de_install_display_version: ${{ inputs.o3de_install_display_version }}
+      o3de_install_build_version: ${{ inputs.o3de_install_build_version }}
+      installer_download_url: ${{ inputs.installer_download_url }}
+      run_installer_test: ${{ inputs.run_installer_test }}
+      installer_s3_path: ${{ inputs.windows_installer_s3_path }}
+      environment: ${{ inputs.environment }}
+    secrets: inherit
+
+  Linux:
+    if: ${{ inputs.platforms == 'linux' || inputs.platforms == 'both' }}
+    uses: ./.github/workflows/linux-package.yml
+    with:
+      image: ${{ inputs.linux_image }}
+      engine_repo: ${{ inputs.engine_repo }}
+      engine_ref: ${{ inputs.engine_ref }}
+      o3de_install_version: ${{ inputs.o3de_install_version }}
+      o3de_install_display_version: ${{ inputs.o3de_install_display_version }}
+      o3de_install_build_version: ${{ inputs.o3de_install_build_version }}
+      installer_download_url: ${{ inputs.installer_download_url }}
+      # Linux installer_test harness not yet implemented; keep off until it exists.
+      run_installer_test: false
+      installer_s3_path: ${{ inputs.linux_installer_s3_path }}
+      environment: ${{ inputs.environment }}
+    secrets: inherit

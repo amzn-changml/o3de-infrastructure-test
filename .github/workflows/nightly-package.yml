@@ -1,0 +1,143 @@
+#
+# Copyright (c) Contributors to the Open 3D Engine Project.
+# For complete copyright and license terms please see the LICENSE at the root of this distribution.
+#
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+#
+
+name: Nightly Package
+
+# Scheduled packaging builds. Triggers the reusable package workflows
+# (windows-package.yml / linux-package.yml) on manual dispatch, and on a cron once
+# one is enabled below. Nightly job selection stays in the TAGS arrays in
+# scripts/build/Platform/<P>/build_config.json, listable via
+# scripts/build/ci_build.py --list-types --tag nightly-installer.
+# Note: `on: schedule` only fires on the repository's default branch. To enable
+# nightly runs, add a schedule trigger alongside workflow_dispatch:
+#   schedule:
+#     - cron: '0 8 * * *'   # 08:00 UTC daily, off-peak for CI runners
+
+run-name: Nightly Package - ${{ inputs.platforms || 'both' }} (${{ inputs.engine_ref || 'development' }})
+
+on:
+  workflow_dispatch:
+    # Inputs mirror package.yml so a manual nightly run behaves like a manual Package run
+    inputs:
+      platforms:
+        description: Which OS installer(s) to produce.
+        type: choice
+        options:
+          - windows
+          - linux
+          - both
+        default: both
+      engine_repo:
+        description: O3DE engine repository (owner/name) to package.
+        type: string
+        default: o3de/o3de
+      engine_ref:
+        description: Branch/tag/SHA of the engine to package.
+        type: string
+        default: development
+      windows_image:
+        description: GitHub-hosted runner image for the Windows installer.
+        type: string
+        default: windows-2022
+      linux_image:
+        description: GitHub-hosted runner image for the Linux installer (e.g. ubuntu-22.04, ubuntu-24.04).
+        type: string
+        default: ubuntu-22.04
+      o3de_install_version:
+        description: The O3DE version in the installer filename and engine version.
+        type: string
+        default: ""
+      o3de_install_display_version:
+        description: The O3DE display version in the installer filename and engine display version.
+        type: string
+        default: ""
+      o3de_install_build_version:
+        description: The O3DE version shown in the splash screens.
+        type: string
+        default: ""
+      installer_download_url:
+        description: Base URL embedded into the installer for downloading additional artifacts.
+        type: string
+        default: ""
+      windows_installer_s3_path:
+        description: S3 object key (leading slash) for the Windows installer that installer_test pulls.
+        type: string
+        default: /development/Latest/Windows/o3de_installer.exe
+      linux_installer_s3_path:
+        description: S3 object key (leading slash) for the Linux installer.
+        type: string
+        default: /development/Latest/Linux/o3de_installer.deb
+      run_installer_test:
+        description: Run the installer smoke test after the build (Windows only for now).
+        type: boolean
+        default: true
+      environment:
+        description: GitHub Environment supplying signing/upload secrets. Empty runs unsigned with no upload.
+        type: string
+        default: packaging
+
+# On the scheduled trigger `inputs.*` is empty, so each value resolves via `|| <default>`
+jobs:
+  # Log which build types are tagged nightly; does not gate the packaging jobs
+  List-Nightly-Types:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout engine
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.engine_repo || 'o3de/o3de' }}
+          ref: ${{ inputs.engine_ref || 'development' }}
+          show-progress: false
+      - name: Checkout packaging tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: .packaging-tooling
+          show-progress: false
+      - name: Overlay packaging tooling
+        run: |
+          cp -av .packaging-tooling/engine-tooling/scripts/build/. scripts/build/
+          rm -rf .packaging-tooling
+      - name: List nightly build types
+        # Reads the TAGS arrays from the engine's build_config.json files
+        run: |
+          python3 scripts/build/list_nightly_types.py --tag nightly-installer
+
+  Windows:
+    if: ${{ (inputs.platforms || 'both') == 'windows' || (inputs.platforms || 'both') == 'both' }}
+    uses: ./.github/workflows/windows-package.yml
+    with:
+      image: ${{ inputs.windows_image || 'windows-2022' }}
+      engine_repo: ${{ inputs.engine_repo || 'o3de/o3de' }}
+      engine_ref: ${{ inputs.engine_ref || 'development' }}
+      msvc_toolset_version: "14.44"
+      msvc_platform_toolset: "v143"
+      o3de_install_version: ${{ inputs.o3de_install_version || '' }}
+      o3de_install_display_version: ${{ inputs.o3de_install_display_version || '' }}
+      o3de_install_build_version: ${{ inputs.o3de_install_build_version || '' }}
+      installer_download_url: ${{ inputs.installer_download_url || '' }}
+      run_installer_test: ${{ inputs.run_installer_test == null && true || inputs.run_installer_test }}
+      installer_s3_path: ${{ inputs.windows_installer_s3_path || '/development/Latest/Windows/o3de_installer.exe' }}
+      environment: ${{ inputs.environment || 'packaging' }}
+    secrets: inherit
+
+  Linux:
+    if: ${{ (inputs.platforms || 'both') == 'linux' || (inputs.platforms || 'both') == 'both' }}
+    uses: ./.github/workflows/linux-package.yml
+    with:
+      image: ${{ inputs.linux_image || 'ubuntu-22.04' }}
+      engine_repo: ${{ inputs.engine_repo || 'o3de/o3de' }}
+      engine_ref: ${{ inputs.engine_ref || 'development' }}
+      o3de_install_version: ${{ inputs.o3de_install_version || '' }}
+      o3de_install_display_version: ${{ inputs.o3de_install_display_version || '' }}
+      o3de_install_build_version: ${{ inputs.o3de_install_build_version || '' }}
+      installer_download_url: ${{ inputs.installer_download_url || '' }}
+      # Linux installer_test harness not yet implemented; keep off until it exists.
+      run_installer_test: false
+      installer_s3_path: ${{ inputs.linux_installer_s3_path || '/development/Latest/Linux/o3de_installer.deb' }}
+      environment: ${{ inputs.environment || 'packaging' }}
+    secrets: inherit

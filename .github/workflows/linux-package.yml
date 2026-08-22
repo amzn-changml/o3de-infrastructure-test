@@ -1,0 +1,288 @@
+#
+# Copyright (c) Contributors to the Open 3D Engine Project.
+# For complete copyright and license terms please see the LICENSE at the root of this distribution.
+#
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+#
+
+name: Linux Package
+
+# Builds, signs, and uploads the O3DE Linux installer SDK (.deb). Build/sign/package
+# presets live in scripts/build/Platform/Linux/build_config.json, driven by
+# scripts/build/ci_build.py.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: GitHub-hosted runner image (e.g. ubuntu-22.04, ubuntu-24.04).
+        required: false
+        type: string
+        default: ubuntu-22.04
+      engine_repo:
+        description: O3DE engine repository (owner/name) to check out and package.
+        required: false
+        type: string
+        default: o3de/o3de
+      engine_ref:
+        description: Branch/tag/SHA of the engine to package.
+        required: false
+        type: string
+        default: development
+      cmake_version:
+        description: CMake version constraint to install.
+        required: false
+        type: string
+        default: "4.2.3"
+      clang_version:
+        description: Clang major version to install.
+        required: false
+        type: string
+        default: "18"
+      gcc_version:
+        description: gcc major version to install.
+        required: false
+        type: string
+        default: "13"
+      o3de_install_version:
+        description: The O3DE version in the installer filename and engine version.
+        required: false
+        type: string
+        default: ""
+      o3de_install_display_version:
+        description: The O3DE display version in the installer filename and engine display version.
+        required: false
+        type: string
+        default: ""
+      o3de_install_build_version:
+        description: The O3DE version shown in the splash screens.
+        required: false
+        type: string
+        default: ""
+      installer_download_url:
+        description: Base URL embedded into the installer for downloading additional artifacts.
+        required: false
+        type: string
+        default: ""
+      run_installer_test:
+        description: Run the installer smoke test after the build (Linux harness not yet implemented).
+        required: false
+        type: boolean
+        default: false
+      installer_s3_path:
+        description: "Path to the built installer in S3 (object key, leading slash)."
+        required: false
+        type: string
+        default: /development/Latest/Linux/o3de_installer.deb
+      environment:
+        description: GitHub Environment supplying the signing/upload secrets. Leave empty to run unsigned with no upload.
+        required: false
+        type: string
+        default: ""
+
+run-name: Linux Package - ${{ inputs.engine_ref }}
+
+# Note: All 3P Github Actions use the commit hash for security reasons
+# Avoid using the tag version, which is vulnerable to supply chain attacks
+
+jobs:
+  Build-Installer:
+    runs-on: ${{ inputs.image }}
+    environment: ${{ inputs.environment }}
+    outputs:
+      signing_configured: ${{ steps.signing-env.outputs.signing_configured }}
+      installer_s3_uri: ${{ steps.upload-env.outputs.installer_s3_uri }}
+    steps:
+      - name: Check disk space
+        env:
+          MIN_FREE_DISK: 70 # in GB
+        id: check-disk
+        run: |
+          AVAIL_GB=$(df ${{ github.workspace }} --output=avail --block-size=1G | tail -1 | tr -d ' ')
+          echo "Workspace has ${AVAIL_GB}GB available"
+          if [ "$AVAIL_GB" -lt ${{ env.MIN_FREE_DISK }} ]; then
+            echo "needs_resize=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_resize=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Maximize build space
+        if: steps.check-disk.outputs.needs_resize == 'true'
+        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c # v10
+        with:
+          root-reserve-mb: 8000
+          swap-size-mb: 200
+          remove-dotnet: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
+
+      - name: Checkout engine
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ inputs.engine_ref }}
+          show-progress: false
+
+      - name: Checkout packaging tooling
+        # The engine ref supplies only source to build. Build orchestration and the
+        # scripts that handle signing secrets come from this repository, so packaging
+        # any engine repo/ref works and engine-supplied scripts never run with secrets.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: .packaging-tooling
+          show-progress: false
+
+      - name: Overlay packaging tooling
+        run: |
+          cp -av .packaging-tooling/engine-tooling/scripts/build/. scripts/build/
+          rm -rf .packaging-tooling
+
+      - name: Git LFS pull
+        run: |
+          git lfs install
+          git lfs pull
+
+      - name: Setup 3p, user, and build folders
+        run: |
+          mkdir -p .o3de build 3rdParty && ln -sf "$(pwd)/.o3de" ~/.o3de
+
+      - name: Setup ccache
+        # Package runs start on cold runners, so persist the compiler cache across
+        # runs via the GitHub cache. 5G compressed keeps within the repo cache quota.
+        uses: chocobo1/setup-ccache-action@37c3347f8a7738e82aab7a06f276f7a12e3008fb # v1.5.3
+        continue-on-error: true
+        if: always()
+        with:
+          prepend_symlinks_to_path: false
+          store_cache: true
+          restore_cache: true
+          ccache_options: |
+            cache_dir=${{ github.workspace }}/.ccache
+            hash_dir=false
+            max_size=5G
+
+      - name: Setup cmake
+        if: ${{ inputs.cmake_version }}
+        uses: lukka/get-cmake@f176ccd3f28bda569c43aae4894f06b2435a3375 # v4.2.3
+        with:
+          cmakeVersion: "${{ inputs.cmake_version }}"
+
+      - name: Set GCC version
+        if: ${{ inputs.gcc_version }}
+        run: |
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-${{ inputs.gcc_version }} g++-${{ inputs.gcc_version }}
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ inputs.gcc_version }} 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${{ inputs.gcc_version }} 100
+
+      - name: Install specific clang version
+        if: ${{ inputs.clang_version }}
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh ${{ inputs.clang_version }}
+          sudo apt-get install -y lld-${{ inputs.clang_version }} clang-tools-${{ inputs.clang_version }}
+          echo "CC=$(which clang-${{ inputs.clang_version }})" >> $GITHUB_ENV
+          echo "CXX=$(which clang++-${{ inputs.clang_version }})" >> $GITHUB_ENV
+
+      - name: Configure environment
+        continue-on-error: true
+        run: |
+          echo "Installing dependencies"
+          pushd ./scripts/build/build_node/Platform/Linux
+          sudo ./install-ubuntu.sh
+          popd
+          echo "Getting python..."
+          ./python/get_python.sh
+          echo "Installing additional python dependencies..."
+          ./python/pip.sh install tempfile2 PyGithub
+          # dpkg-sig is required by scripts/signer/Platform/Linux/signer.sh
+          sudo apt-get install -qq dpkg-sig -y
+          sudo apt -y autoremove --purge
+          sudo apt clean
+          df -h
+
+      - name: Configure signing
+        # Import the GPG private key secret into the keyring; absent secrets produce an
+        # unsigned package. Signing only engages when CPACK_UPLOAD_URL is set.
+        id: signing-env
+        env:
+          O3DE_GPG_PRIVATE_KEY: ${{ secrets.O3DE_GPG_PRIVATE_KEY }}
+          O3DE_GPG_PASSPHRASE: ${{ secrets.O3DE_GPG_PASSPHRASE }}
+        run: |
+          export GPG_TTY=$(tty || true)
+          set -o pipefail
+          python/python.sh -u scripts/build/prepare_signing.py --platform Linux | while IFS= read -r line; do
+            case "$line" in
+              "ENV "*) echo "${line#ENV }" >> "$GITHUB_ENV" ;;
+              "OUTPUT "*) echo "${line#OUTPUT }" >> "$GITHUB_OUTPUT" ;;
+              *) echo "$line" ;;
+            esac
+          done
+
+      - name: Compute upload/installer URI
+        # Empty bucket secret means no S3 upload (and no signing, which requires upload)
+        id: upload-env
+        env:
+          INSTALLER_S3_BUCKET: ${{ secrets.INSTALLER_S3_BUCKET }}
+        run: |
+          set -o pipefail
+          python/python.sh -u scripts/build/compute_upload_uri.py --s3-path "${{ inputs.installer_s3_path }}" | while IFS= read -r line; do
+            case "$line" in
+              "ENV "*) echo "${line#ENV }" >> "$GITHUB_ENV" ;;
+              "OUTPUT "*) echo "${line#OUTPUT }" >> "$GITHUB_OUTPUT" ;;
+              *) echo "$line" ;;
+            esac
+          done
+
+      - name: Build installer
+        # Builds with presets in ../scripts/build/Platform/Linux/build_config.json
+        timeout-minutes: 600
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          LY_3RDPARTY_PATH: ${{ github.workspace }}/3rdParty
+          LY_PACKAGE_SERVER_URLS: "https://d1gg6ket0m44ly.cloudfront.net;https://d3t6xeg4fgfoum.cloudfront.net"
+          O3DE_INSTALL_VERSION: ${{ inputs.o3de_install_version }}
+          O3DE_INSTALL_DISPLAY_VERSION: ${{ inputs.o3de_install_display_version }}
+          O3DE_INSTALL_BUILD_VERSION: ${{ inputs.o3de_install_build_version }}
+          INSTALLER_DOWNLOAD_URL: ${{ inputs.installer_download_url }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || secrets.AWS_DEFAULT_REGION }}
+        run: |
+          # install-ubuntu.sh writes LY_NDK_DIR (needed by the android mono steps) to
+          # /etc/profile.d/android-env.sh, which non-login CI shells do not source
+          [ -f /etc/profile.d/android-env.sh ] && source /etc/profile.d/android-env.sh
+          export EXTRA_CMAKE_OPTIONS="-DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX"
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          python/python.sh -u scripts/build/ci_build.py --platform Linux --type installer_pipe
+
+      - name: Save installer artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        with:
+          name: O3DE-Linux-installer
+          compression-level: 1
+          overwrite: true
+          if-no-files-found: warn
+          path: |
+            ${{ github.workspace }}/build/linux/CPackUploads/*.deb
+            ${{ github.workspace }}/build/linux/CPackUploads/*.sha256
+
+  # Linux installer_test harness is not yet implemented; stub matches the Windows job shape
+  Installer-Test:
+    needs: Build-Installer
+    if: ${{ inputs.run_installer_test && !cancelled() && needs.Build-Installer.result == 'success' }}
+    runs-on: ${{ inputs.image }}
+    steps:
+      - name: Not yet implemented
+        run: |
+          echo "::warning::Linux installer_test is not yet implemented. Skipping."
+          echo "Add a Linux installer_test preset to scripts/build/Platform/Linux/build_config.json"
+          echo "and a pytest harness under cmake/Platform/Linux/Packaging/Tests, then mirror"
+          echo "the Windows Installer-Test job here."
