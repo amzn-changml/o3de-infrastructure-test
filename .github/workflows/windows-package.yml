@@ -75,29 +75,77 @@ on:
         required: false
         type: string
         default: /development/Latest/Windows/o3de_installer.exe
-      environment:
-        description: GitHub Environment supplying the signing/upload secrets. Leave empty to run unsigned with no upload.
+    secrets:
+      O3DE_MS_DLIB_B64:
+        description: Base64 CodeSigning.Dlib.dll for MS Trusted Signing. Absent produces an unsigned installer.
         required: false
-        type: string
-        default: ""
+      O3DE_MS_METADATA_JSON:
+        description: MS Trusted Signing metadata JSON.
+        required: false
+      INSTALLER_S3_BUCKET:
+        description: S3 bucket for the installer upload. Absent disables upload.
+        required: false
+      AWS_ACCESS_KEY_ID:
+        description: AWS access key for the installer upload and test download.
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        description: AWS secret key for the installer upload and test download.
+        required: false
+      AWS_REGION:
+        description: AWS region for the installer upload and test download.
+        required: false
 
 run-name: Windows Package - ${{ inputs.engine_ref }}
 
 # Note: All 3P Github Actions use the commit hash for security reasons
 # Avoid using the tag version, which is vulnerable to supply chain attacks
 
+permissions:
+  contents: read
+
 jobs:
+  # Signing and upload secrets are reachable only when the engine repository being
+  # packaged is allowlisted here. Any other repository resolves to no environment,
+  # which builds unsigned with no upload and no secret in any step. A failure in
+  # this job blocks the jobs that depend on it.
+  Resolve-Trust:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      environment: ${{ steps.trust.outputs.environment }}
+    steps:
+      - name: Resolve secret environment from engine repo
+        id: trust
+        env:
+          ENGINE_REPO: ${{ inputs.engine_repo }}
+        run: |
+          case "$ENGINE_REPO" in
+            o3de/o3de|amzn-changml/o3de)
+              echo "environment=packaging" >> "$GITHUB_OUTPUT"
+              echo "$ENGINE_REPO is allowlisted; signing and upload are available" ;;
+            *)
+              echo "environment=" >> "$GITHUB_OUTPUT"
+              echo "::notice::$ENGINE_REPO is not allowlisted; building unsigned with no upload" ;;
+          esac
+
   Build-Installer:
+    needs: Resolve-Trust
     runs-on: ${{ inputs.image }}
-    environment: ${{ inputs.environment }}
+    environment: ${{ needs.Resolve-Trust.outputs.environment }}
     outputs:
       signing_configured: ${{ steps.signing-env.outputs.signing_configured }}
       installer_s3_uri: ${{ steps.upload-env.outputs.installer_s3_uri }}
     env:
       CMAKE_C_COMPILER_LAUNCHER: C:\ProgramData\Chocolatey\bin\ccache.exe
       CMAKE_CXX_COMPILER_LAUNCHER: C:\ProgramData\Chocolatey\bin\ccache.exe
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout engine
+        # Credentials persist here because the Git LFS pull below re-contacts the
+        # remote, which a private engine fork requires. Every other checkout in
+        # this workflow sets persist-credentials: false.
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.engine_repo }}
@@ -105,12 +153,19 @@ jobs:
           show-progress: false
 
       - name: Checkout packaging tooling
-        # The engine ref supplies only source to build. Build orchestration and the
-        # scripts that handle signing secrets come from this repository, so packaging
-        # any engine repo/ref works and engine-supplied scripts never run with secrets.
-        # Runs before the DevDrive workspace copy so the overlay is carried across.
+        # Supplies the build orchestration and the scripts that handle signing
+        # material, so any engine repo/ref can be packaged even when it does not
+        # carry this tooling. Runs before the DevDrive workspace copy so the
+        # overlay is carried across.
+        #
+        # Scope of the overlay: it replaces the python files under scripts\build
+        # listed in engine-tooling. It does NOT replace build_config.json,
+        # scripts\build\Platform\<P>\*.cmd, cmake\, or scripts\signer\, all of
+        # which come from the packaged ref and are executed by the build. Secrets
+        # are gated by the Resolve-Trust allowlist, not by this overlay.
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           path: .packaging-tooling
           show-progress: false
 
@@ -172,6 +227,11 @@ jobs:
           cmakeVersion: "${{ inputs.cmake_version }}"
 
       - name: Configure generator/toolset env for CMake
+        # Toolset values arrive via env rather than inline interpolation so a
+        # crafted input cannot inject PowerShell here.
+        env:
+          MSVC_PLATFORM_TOOLSET: ${{ inputs.msvc_platform_toolset }}
+          MSVC_TOOLSET_VERSION: ${{ inputs.msvc_toolset_version }}
         run: |
           $cap = cmake -E capabilities | ConvertFrom-Json
           $maj = [int]$cap.version.major
@@ -179,8 +239,8 @@ jobs:
 
           echo "CMAKE_GENERATOR=Visual Studio 17 2022" >> $env:GITHUB_ENV
 
-          $platformToolset = "${{ inputs.msvc_platform_toolset }}"
-          $toolsetVersion  = "${{ inputs.msvc_toolset_version }}"
+          $platformToolset = $env:MSVC_PLATFORM_TOOLSET
+          $toolsetVersion  = $env:MSVC_TOOLSET_VERSION
 
           if (![string]::IsNullOrWhiteSpace($platformToolset)) {
             if (($maj -gt 3 -or ($maj -eq 3 -and $min -ge 25)) -and ![string]::IsNullOrWhiteSpace($toolsetVersion)) {
@@ -192,10 +252,16 @@ jobs:
 
       - name: Install specific MSVC toolset
         if: ${{ inputs.msvc_toolset_version && inputs.msvc_platform_toolset }}
+        env:
+          MSVC_TOOLSET_VERSION: ${{ inputs.msvc_toolset_version }}
         run: |
+          if ($env:MSVC_TOOLSET_VERSION -notmatch '^[0-9]+\.[0-9]+$') {
+            echo "::error::msvc_toolset_version must look like 14.44, got '$env:MSVC_TOOLSET_VERSION'"
+            exit 1
+          }
           & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe" modify `
             --installPath "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise" `
-            --add "Microsoft.VisualStudio.Component.VC.${{ inputs.msvc_toolset_version }}.x86.x64" --quiet --wait
+            --add "Microsoft.VisualStudio.Component.VC.$($env:MSVC_TOOLSET_VERSION).x86.x64" --quiet --wait
 
       - name: Set MSBuild options (default toolset)
         if: ${{ !inputs.msvc_toolset_version }}
@@ -236,9 +302,10 @@ jobs:
         id: upload-env
         env:
           INSTALLER_S3_BUCKET: ${{ secrets.INSTALLER_S3_BUCKET }}
+          INSTALLER_S3_PATH: ${{ inputs.installer_s3_path }}
         working-directory: ${{ env.DEV_DRIVE_WORKSPACE }}
         run: |
-          python\python.cmd -u scripts\build\compute_upload_uri.py --s3-path "${{ inputs.installer_s3_path }}" 2>&1 | ForEach-Object {
+          python\python.cmd -u scripts\build\compute_upload_uri.py --s3-path "$env:INSTALLER_S3_PATH" 2>&1 | ForEach-Object {
             if ($_ -match '^ENV (.+)$') { $matches[1] | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
             elseif ($_ -match '^OUTPUT (.+)$') { $matches[1] | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8 }
             else { Write-Host $_ }
@@ -278,7 +345,7 @@ jobs:
           INSTALLER_DOWNLOAD_URL: ${{ inputs.installer_download_url }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || secrets.AWS_DEFAULT_REGION }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
         run: |
           $env:LY_3RDPARTY_PATH = "${{ env.DEV_DRIVE_WORKSPACE }}\3rdParty"
           $env:LY_PACKAGE_SERVER_URLS = "https://d1gg6ket0m44ly.cloudfront.net;https://d3t6xeg4fgfoum.cloudfront.net"
@@ -304,14 +371,18 @@ jobs:
 
   # Installs the built installer, creates and builds a project against it, then uninstalls
   Installer-Test:
-    needs: Build-Installer
+    needs: [Resolve-Trust, Build-Installer]
     if: ${{ inputs.run_installer_test && !cancelled() && needs.Build-Installer.result == 'success' }}
     runs-on: ${{ inputs.image }}
-    environment: ${{ inputs.environment }}
+    environment: ${{ needs.Resolve-Trust.outputs.environment }}
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout engine
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           repository: ${{ inputs.engine_repo }}
           ref: ${{ inputs.engine_ref }}
           show-progress: false
@@ -319,6 +390,7 @@ jobs:
       - name: Checkout packaging tooling
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           path: .packaging-tooling
           show-progress: false
 
@@ -353,10 +425,13 @@ jobs:
       - name: Resolve installer URI
         # Prefer the S3 URI from the build job, else the downloaded artifact
         id: resolve-uri
+        env:
+          BUILD_S3_URI: ${{ needs.Build-Installer.outputs.installer_s3_uri }}
+          DOWNLOAD_DIR: ${{ github.workspace }}\installer_download
         run: |
           python\python.cmd -u scripts\build\resolve_installer_uri.py `
-            --s3-uri "${{ needs.Build-Installer.outputs.installer_s3_uri }}" `
-            --download-dir "${{ github.workspace }}\installer_download" `
+            --s3-uri "$env:BUILD_S3_URI" `
+            --download-dir "$env:DOWNLOAD_DIR" `
             --glob "*.exe" 2>&1 | ForEach-Object {
             if ($_ -match '^OUTPUT (.+)$') { $matches[1] | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8 }
             else { Write-Host $_ }
@@ -370,7 +445,7 @@ jobs:
           INSTALLER_S3_PATH: ${{ inputs.installer_s3_path }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || secrets.AWS_DEFAULT_REGION }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
           RESOLVED_INSTALLER_URI: ${{ steps.resolve-uri.outputs.installer_uri }}
         run: |
           # When S3 is not configured, point the build_config default at the resolved local installer.
