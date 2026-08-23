@@ -76,26 +76,29 @@ on:
         description: Run the installer smoke test after the build (Windows only for now).
         type: boolean
         default: true
-      environment:
-        description: GitHub Environment supplying signing/upload secrets. Empty runs unsigned with no upload.
-        type: string
-        default: packaging
+
+permissions:
+  contents: read
 
 # On the scheduled trigger `inputs.*` is empty, so each value resolves via `|| <default>`
 jobs:
   # Log which build types are tagged nightly; does not gate the packaging jobs
   List-Nightly-Types:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout engine
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           repository: ${{ inputs.engine_repo || 'o3de/o3de' }}
           ref: ${{ inputs.engine_ref || 'development' }}
           show-progress: false
       - name: Checkout packaging tooling
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           path: .packaging-tooling
           show-progress: false
       - name: Overlay packaging tooling
@@ -122,8 +125,13 @@ jobs:
       installer_download_url: ${{ inputs.installer_download_url || '' }}
       run_installer_test: ${{ inputs.run_installer_test == null && true || inputs.run_installer_test }}
       installer_s3_path: ${{ inputs.windows_installer_s3_path || '/development/Latest/Windows/o3de_installer.exe' }}
-      environment: ${{ inputs.environment || 'packaging' }}
-    secrets: inherit
+    secrets:
+      O3DE_MS_DLIB_B64: ${{ secrets.O3DE_MS_DLIB_B64 }}
+      O3DE_MS_METADATA_JSON: ${{ secrets.O3DE_MS_METADATA_JSON }}
+      INSTALLER_S3_BUCKET: ${{ secrets.INSTALLER_S3_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
 
   Linux:
     if: ${{ (inputs.platforms || 'both') == 'linux' || (inputs.platforms || 'both') == 'both' }}
@@ -139,5 +147,10 @@ jobs:
       # Linux installer_test harness not yet implemented; keep off until it exists.
       run_installer_test: false
       installer_s3_path: ${{ inputs.linux_installer_s3_path || '/development/Latest/Linux/o3de_installer.deb' }}
-      environment: ${{ inputs.environment || 'packaging' }}
-    secrets: inherit
+    secrets:
+      O3DE_GPG_PRIVATE_KEY: ${{ secrets.O3DE_GPG_PRIVATE_KEY }}
+      O3DE_GPG_PASSPHRASE: ${{ secrets.O3DE_GPG_PASSPHRASE }}
+      INSTALLER_S3_BUCKET: ${{ secrets.INSTALLER_S3_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}

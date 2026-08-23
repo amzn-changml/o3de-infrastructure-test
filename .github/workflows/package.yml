@@ -68,10 +68,9 @@ on:
         description: Run the installer smoke test after the build (Windows only for now).
         type: boolean
         default: true
-      environment:
-        description: GitHub Environment supplying signing/upload secrets. Empty runs unsigned with no upload.
-        type: string
-        default: packaging
+
+permissions:
+  contents: read
 
 jobs:
   Windows:
@@ -89,8 +88,13 @@ jobs:
       installer_download_url: ${{ inputs.installer_download_url }}
       run_installer_test: ${{ inputs.run_installer_test }}
       installer_s3_path: ${{ inputs.windows_installer_s3_path }}
-      environment: ${{ inputs.environment }}
-    secrets: inherit
+    secrets:
+      O3DE_MS_DLIB_B64: ${{ secrets.O3DE_MS_DLIB_B64 }}
+      O3DE_MS_METADATA_JSON: ${{ secrets.O3DE_MS_METADATA_JSON }}
+      INSTALLER_S3_BUCKET: ${{ secrets.INSTALLER_S3_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
 
   Linux:
     if: ${{ inputs.platforms == 'linux' || inputs.platforms == 'both' }}
@@ -106,5 +110,10 @@ jobs:
       # Linux installer_test harness not yet implemented; keep off until it exists.
       run_installer_test: false
       installer_s3_path: ${{ inputs.linux_installer_s3_path }}
-      environment: ${{ inputs.environment }}
-    secrets: inherit
+    secrets:
+      O3DE_GPG_PRIVATE_KEY: ${{ secrets.O3DE_GPG_PRIVATE_KEY }}
+      O3DE_GPG_PASSPHRASE: ${{ secrets.O3DE_GPG_PASSPHRASE }}
+      INSTALLER_S3_BUCKET: ${{ secrets.INSTALLER_S3_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
